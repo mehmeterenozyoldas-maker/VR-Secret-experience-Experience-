@@ -3,11 +3,14 @@ import { VRButton } from 'three/examples/jsm/webxr/VRButton.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { XRControllerModelFactory } from 'three/examples/jsm/webxr/XRControllerModelFactory.js';
 import { XRHandModelFactory } from 'three/examples/jsm/webxr/XRHandModelFactory.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import * as Tone from 'tone';
 
 export function createXREngine(containerNode, onLoaded) {
     // --- GLOBAL STATE ---
-    let scene, camera, renderer, cameraGroup;
+    let scene, camera, renderer, cameraGroup, composer;
     let controllers = [];
     let raycaster;
     let leftWristHUD = null;
@@ -48,6 +51,7 @@ export function createXREngine(containerNode, onLoaded) {
     let hoveredUIElement = null; 
     let draggedArtifact = null; 
     let activeSlider = null; 
+    let activeTeleportAnim = null;
     const tossVelocity = new THREE.Vector2(0, 0);
 
     // Gaze Dwell Selection Parameters
@@ -81,6 +85,7 @@ export function createXREngine(containerNode, onLoaded) {
     setTimeout(triggerLoaded, 2500);
     
     const gltfLoader = new GLTFLoader(manager);
+    const gltfCache = new Map();
 
     init();
     
@@ -118,6 +123,16 @@ export function createXREngine(containerNode, onLoaded) {
         renderer.toneMapping = THREE.ACESFilmicToneMapping;
         renderer.toneMappingExposure = 1.2; 
         
+        const renderScene = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+        bloomPass.threshold = 0.2;
+        bloomPass.strength = 1.0;
+        bloomPass.radius = 0.5;
+        
+        composer = new EffectComposer(renderer);
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
         containerNode.appendChild(renderer.domElement);
         
         // Add VR Button to container rather than body to isolate
@@ -137,10 +152,26 @@ export function createXREngine(containerNode, onLoaded) {
         containerNode.appendChild(vrButton);
 
         renderer.xr.addEventListener('sessionstart', () => {
+            // Keep renderer.shadowMap.enabled = true to avoid destroying WebGL compiled shader programs at runtime!
+            // Instead, disable castShadow on lights to double VR framerate elegantly without compiling errors.
+            scene.traverse(child => {
+                if (child.isLight) {
+                    if (child.castShadow) {
+                        child.userData.wasCastingShadow = true;
+                        child.castShadow = false;
+                    }
+                }
+            });
             window.dispatchEvent(new CustomEvent('hm-telemetry', { detail: { action: 'SYSTEM', item: 'VR Session Started' } }));
         });
 
         renderer.xr.addEventListener('sessionend', () => {
+            // Restore shadow casting on lights for high quality desktop viewport
+            scene.traverse(child => {
+                if (child.isLight && child.userData.wasCastingShadow) {
+                    child.castShadow = true;
+                }
+            });
             window.dispatchEvent(new CustomEvent('hm-telemetry', { detail: { action: 'SYSTEM', item: 'VR Session Ended' } }));
             window.dispatchEvent(new CustomEvent('xr-session-ended'));
         });
@@ -165,27 +196,53 @@ export function createXREngine(containerNode, onLoaded) {
         teleportMarker.visible = false;
         scene.add(teleportMarker);
 
-        // Load Exhibits
-        buildExhibit(
-            loadGLTFArtifact('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Corset/glTF-Binary/Corset.glb', 20.0, null),
-            "1890s Avant-Garde Corset",
-            "Open source museum resource. A radical Victorian piece featuring intricate threading, metal boning, and bold structural silhouettes pushing the boundaries of 19th century fashion.",
-            new THREE.Vector3(-3.4, 0, -2.5), Math.PI / 6.5, "corset_1890"
-        );
+        // Define Data Schema for Virtual Artifacts
+        const artifactSchema = [
+            {
+                id: "corset_1890",
+                title: "1890s Avant-Garde Corset",
+                description: "Open source museum resource. A radical Victorian piece featuring intricate threading, metal boning, and bold structural silhouettes pushing the boundaries of 19th century fashion.",
+                url: 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Corset/glTF-Binary/Corset.glb',
+                scale: 20.0,
+                position: new THREE.Vector3(-3.4, 0, -2.5),
+                rotationY: Math.PI / 6.5
+            },
+            {
+                id: "corset_court",
+                title: "Court Silhouette Bodice",
+                description: "Curated historical garment. This piece laid the foundation for modern haute couture with its exaggerated hour-glass structuring.",
+                url: 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Corset/glTF-Binary/Corset.glb',
+                scale: 18.0,
+                position: new THREE.Vector3(0, 0, -4.2),
+                rotationY: 0
+            },
+            {
+                id: "vintage_shoe",
+                title: "Vintage Haute Slipper",
+                description: "Archival footwear from early 20th century, representing the intersection of sportswear and avant-garde craftsmanship.",
+                url: 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/MaterialsVariantsShoe/glTF-Binary/MaterialsVariantsShoe.glb',
+                scale: 5.0,
+                position: new THREE.Vector3(3.4, 0, -2.5),
+                rotationY: -Math.PI / 6.5
+            }
+        ];
 
-        buildExhibit(
-            loadGLTFArtifact('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Corset/glTF-Binary/Corset.glb', 18.0, null, 0.4),
-            "Court Silhouette Bodice",
-            "Curated historical garment. This piece laid the foundation for modern haute couture with its exaggerated hour-glass structuring.",
-            new THREE.Vector3(0, 0, -4.2), 0, "corset_court"
-        );
+        // Load Exhibits from Schema
+        artifactSchema.forEach(item => {
+            let fallbackGen = null;
+            if (item.id === "corset_1890") fallbackGen = createParametricGown;
+            else if (item.id === "corset_court") fallbackGen = createCyberGown;
+            else if (item.id === "vintage_shoe") fallbackGen = createOrreryArtifact;
 
-        buildExhibit(
-            loadGLTFArtifact('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/MaterialsVariantsShoe/glTF-Binary/MaterialsVariantsShoe.glb', 5.0, null),
-            "Vintage Haute Slipper",
-            "Archival footwear from early 20th century, representing the intersection of sportswear and avant-garde craftsmanship.",
-            new THREE.Vector3(3.4, 0, -2.5), -Math.PI / 6.5, "vintage_shoe"
-        );
+            buildExhibit(
+                loadGLTFArtifact(item.url, item.scale, fallbackGen),
+                item.title,
+                item.description,
+                item.position,
+                item.rotationY,
+                item.id
+            );
+        });
 
         raycaster = new THREE.Raycaster();
         setupXRControllers();
@@ -576,6 +633,39 @@ export function createXREngine(containerNode, onLoaded) {
     }
 
     function setupLightingAndEnvironment() {
+        // Dynamic Ambient Skybox
+        const skyGeo = new THREE.SphereGeometry(80, 32, 15);
+        const skyMat = new THREE.ShaderMaterial({
+            uniforms: {
+                topColor: { value: new THREE.Color(0xdce5eb) },
+                bottomColor: { value: new THREE.Color(0xf5f5f0) },
+                offset: { value: 33 },
+                exponent: { value: 0.6 }
+            },
+            vertexShader: `
+                varying vec3 vWorldPosition;
+                void main() {
+                    vec4 worldPosition = modelMatrix * vec4( position, 1.0 );
+                    vWorldPosition = worldPosition.xyz;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 topColor;
+                uniform vec3 bottomColor;
+                uniform float offset;
+                uniform float exponent;
+                varying vec3 vWorldPosition;
+                void main() {
+                    float h = normalize( vWorldPosition + offset ).y;
+                    gl_FragColor = vec4( mix( bottomColor, topColor, max( pow( max( h , 0.0), exponent ), 0.0 ) ), 1.0 );
+                }
+            `,
+            side: THREE.BackSide
+        });
+        const sky = new THREE.Mesh(skyGeo, skyMat);
+        scene.add(sky);
+
         // Soft Nordic Ambient
         ambientLight = new THREE.AmbientLight(0xffeedd, 0.6); scene.add(ambientLight);
         
@@ -1392,6 +1482,19 @@ export function createXREngine(containerNode, onLoaded) {
         return group;
     }
 
+    function fetchGLTF(url) {
+        if (gltfCache.has(url)) {
+            return Promise.resolve(gltfCache.get(url));
+        }
+
+        return new Promise((resolve, reject) => {
+            gltfLoader.load(url, (gltf) => {
+                gltfCache.set(url, gltf);
+                resolve(gltf);
+            }, undefined, reject);
+        });
+    }
+
     function loadGLTFArtifact(url, scale, fallbackGenerator) {
         const group = new THREE.Group();
         const pivot = new THREE.Group(); group.add(pivot);
@@ -1405,8 +1508,9 @@ export function createXREngine(containerNode, onLoaded) {
                 }
             }
         };
-        gltfLoader.load(url, (gltf) => {
-            const model = gltf.scene; model.scale.setScalar(scale);
+
+        fetchGLTF(url).then((gltf) => {
+            const model = gltf.scene.clone(); model.scale.setScalar(scale);
             const box = new THREE.Box3().setFromObject(model);
             const center = box.getCenter(new THREE.Vector3());
             model.position.sub(center); 
@@ -1421,7 +1525,7 @@ export function createXREngine(containerNode, onLoaded) {
                 } 
             });
             pivot.add(model); group.userData.model = pivot;
-        }, undefined, (err) => {
+        }).catch((err) => {
             console.warn("Failed to load GLTF model from", url, "- generating procedural fallback.", err);
             if (fallbackGenerator) {
                 const fallback = fallbackGenerator();
@@ -1429,6 +1533,7 @@ export function createXREngine(containerNode, onLoaded) {
                 group.userData.fallback = fallback;
             }
         });
+
         return group;
     }
 
@@ -2220,16 +2325,26 @@ export function createXREngine(containerNode, onLoaded) {
     function onSqueezeEnd(event) {
         const controller = event.target;
         controller.userData.isTeleporting = false;
-        if (controller.userData.teleportTarget) {
+        if (controller.userData.teleportTarget && !activeTeleportAnim) {
             const headWorld = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
             const shiftX = controller.userData.teleportTarget.x - headWorld.x;
             const shiftZ = controller.userData.teleportTarget.z - headWorld.z;
             
-            cameraGroup.position.x += shiftX;
-            cameraGroup.position.z += shiftZ;
+            const startPos = cameraGroup.position.clone();
+            const endPos = new THREE.Vector3(
+                startPos.x + shiftX,
+                controller.userData.teleportTarget.y + 1.6,
+                startPos.z + shiftZ
+            );
             
-            // Adjust height if teleporting to a raised platform (base is 1.6)
-            cameraGroup.position.y = controller.userData.teleportTarget.y + 1.6; 
+            activeTeleportAnim = {
+                startTime: performance.now(),
+                duration: 250, // ms
+                startPos,
+                endPos
+            };
+            
+            triggerHapticPulse(controller, 0.8, 100);
             
             controller.userData.teleportTarget = null;
         }
@@ -2568,11 +2683,27 @@ export function createXREngine(containerNode, onLoaded) {
         camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix(); 
         renderer.setSize(window.innerWidth, window.innerHeight);
+        if (composer) composer.setSize(window.innerWidth, window.innerHeight);
     }
 
     function render(time) {
         try {
             const timeSec = time * 0.001;
+
+            if (activeTeleportAnim) {
+                const now = performance.now();
+                const elapsed = now - activeTeleportAnim.startTime;
+                let t = elapsed / activeTeleportAnim.duration;
+                if (t >= 1.0) {
+                    t = 1.0;
+                    cameraGroup.position.copy(activeTeleportAnim.endPos);
+                    activeTeleportAnim = null;
+                } else {
+                    // Ease-out cubic
+                    const easeOut = 1 - Math.pow(1 - t, 3);
+                    cameraGroup.position.lerpVectors(activeTeleportAnim.startPos, activeTeleportAnim.endPos, easeOut);
+                }
+            }
 
             windShaders.forEach(s => s.uniforms.windTime.value = timeSec);
 
@@ -2629,6 +2760,12 @@ export function createXREngine(containerNode, onLoaded) {
                 const prevRot = new THREE.Quaternion().setFromRotationMatrix(prevMat);
                 const deltaQuat = currentRot.clone().multiply(prevRot.clone().invert());
                 controller.userData.grabbedObject.quaternion.premultiply(deltaQuat);
+                
+                const curPos = new THREE.Vector3().setFromMatrixPosition(curMat);
+                const prevPos = new THREE.Vector3().setFromMatrixPosition(prevMat);
+                const deltaPos = curPos.clone().sub(prevPos);
+                controller.userData.grabbedObject.position.add(deltaPos);
+                controller.userData.grabbedObject.userData.targetPosition.copy(controller.userData.grabbedObject.position);
                 
                 tossVelocity.set(deltaQuat.y * 0.15, deltaQuat.x * 0.15);
                 controller.userData.grabbedObject.userData.angularVelocity.copy(tossVelocity);
@@ -2859,7 +2996,23 @@ export function createXREngine(containerNode, onLoaded) {
             }
         }
         updateHoverStates(rayOrigins);
-        renderer.render(scene, camera);
+        if (renderer.xr.isPresenting) {
+            if (!window.xrStateResetDone) {
+                renderer.setRenderTarget(null);
+                if (renderer.state && typeof renderer.state.reset === 'function') {
+                    renderer.state.reset();
+                }
+                window.xrStateResetDone = true;
+            }
+            renderer.render(scene, camera);
+        } else {
+            window.xrStateResetDone = false;
+            if (composer) {
+                composer.render();
+            } else {
+                renderer.render(scene, camera);
+            }
+        }
         } catch (e) {
             console.error(e);
             if (!window.renderErrLogged) {
@@ -2895,7 +3048,13 @@ export function createXREngine(containerNode, onLoaded) {
 
     function captureImage() {
         if (!renderer || !scene || !camera) return null;
-        renderer.render(scene, camera);
+        if (renderer.xr.isPresenting) {
+            renderer.render(scene, camera);
+        } else if (composer) {
+            composer.render();
+        } else {
+            renderer.render(scene, camera);
+        }
         return renderer.domElement.toDataURL("image/jpeg", 0.9);
     }
 
@@ -2912,10 +3071,41 @@ export function createXREngine(containerNode, onLoaded) {
              window.removeEventListener('mousemove', windowMouseMoveListener);
              window.removeEventListener('mouseup', windowMouseUpListener);
              window.removeEventListener('click', windowClickListener);
+             
              if (renderer) {
                  renderer.setAnimationLoop(null);
                  renderer.dispose();
              }
+             
+             if (scene) {
+                 scene.traverse((child) => {
+                     if (child.geometry) child.geometry.dispose();
+                     if (child.material) {
+                         if (Array.isArray(child.material)) {
+                             child.material.forEach(m => m.dispose());
+                         } else {
+                             child.material.dispose();
+                         }
+                     }
+                 });
+             }
+             
+             try {
+                Tone.Transport.stop();
+                Tone.Transport.cancel(0);
+                if (mainReverb) mainReverb.dispose();
+                audioNodes.forEach(n => {
+                    if (n.synth) n.synth.dispose();
+                    if (n.filter) n.filter.dispose();
+                    if (n.panner) n.panner.dispose();
+                    if (n.analyser) n.analyser.dispose();
+                    if (n.fft) n.fft.dispose();
+                    if (n.meter) n.meter.dispose();
+                    if (n.loop) n.loop.dispose();
+                });
+             } catch(e) {}
+             
+             if (composer) composer.dispose();
         }
     };
 }
